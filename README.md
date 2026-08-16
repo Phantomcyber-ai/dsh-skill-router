@@ -71,14 +71,14 @@ dev_inject_plugin <本仓库目录>
 | 用户消息 | 自动注入 |
 | --- | --- |
 | 帮我写一份公文 | `official-document-writing` ✓ |
-| 给分行党委中心组补全学习记录 | `study-record-filler` ✓ |
 | 把这份 PDF 转成 Markdown | `markitdown-skill` ✓ |
 | 帮我整理一下今天的工作 | `daily-work-assistant` ✓ |
 | 深度调研一下国产大模型市场 | `deep-research` ✓ |
 | dsh 打不开了，帮我诊断 | `dsh-maintenance` ✓ |
 | 写一份向上级报送的专项报告 | `report-drafting` ✓ |
+| 用 gh 查一下这个 PR | `github` ✓ |
 | 继续 / 嗯 | 跳过（短消息）✓ |
-| 知乎搜索 / 找海报技能 / 网页截图 | 弱信号 → 生产环境由 LLM 判定 ✓ |
+| B站视频转文字 / 知乎搜索 / 找海报技能 / 网页截图 | 弱信号 → 生产环境由 LLM 判定 ✓ |
 
 ## 开发
 

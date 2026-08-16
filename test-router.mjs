@@ -6,7 +6,6 @@ const CATALOG = [
   { name: 'agent-browser', description: 'Browser automation CLI for AI agents. 浏览器自动化：导航、填表、点击、截图、抓取数据、测试 Web 应用。', whenToUse: '用户要求打开网站、填表单、点按钮、截图、抓取网页数据、测试 Web 应用或自动化浏览器操作时使用' },
   { name: 'bili-transcribe', description: 'B站视频语音听译/转写技能 - 将 B 站视频音频下载并转写为中文文本。', whenToUse: '用户给出 B 站视频链接（含 BV 号）要求听译、转写、提取字幕、语音识别全文时使用' },
   { name: 'browser-use', description: 'Automates browser interactions for web testing, form filling, screenshots, and data extraction.', whenToUse: '' },
-  { name: 'study-record-filler', description: '补全分行党委中心组学习记录的研讨发言（多位行领导，重点发言人必含某位，未指定时先询问）。', whenToUse: '补全或生成中心组学习记录、补研讨发言、写中心组学习研讨时使用' },
   { name: 'cordis-plugin-development', description: 'Create, modify, debug, or extend dynamic Cordis Plugins, including Host Services and Events, Client Slot and theme UI.', whenToUse: '创建、修改、调试或扩展动态 Cordis 插件时使用' },
   { name: 'daily-work-assistant', description: '每日工作梳理与可替代任务自我迭代。把零散口述整理成结构化日志、识别可替代任务、沉淀模板。', whenToUse: '用户口述当天工作、要求整理或汇总工作、触发每日工作梳理提醒时使用' },
   { name: 'deep-research', description: '结构化深度调研：/research 出大纲、/research-deep 并行深挖、/research-report 汇总报告。', whenToUse: '深度调研、研究某个主题、技术选型调研、市场分析、尽职调查时使用' },
@@ -64,7 +63,6 @@ async function run(message, { onDemand = false, firstMessage = false } = {}) {
 
 const cases = [
   '帮我写一份公文',
-  '给分行党委中心组补全学习记录',
   '把这份 PDF 转成 Markdown',
   '帮我整理一下今天的工作',
   '深度调研一下国产大模型市场',
@@ -75,6 +73,8 @@ const cases = [
   '帮我找个能画海报的技能',
   '写一份向上级报送的专项报告',
   '帮我截个网页图看看',
+  '用 gh 查一下这个 PR',
+  '把这段 B 站视频转成文字',
 ]
 
 for (const c of cases) {
@@ -83,7 +83,7 @@ for (const c of cases) {
 }
 
 console.log('\n--- on-demand 预设场景（anchored-standard 组合，无 skill 工具） ---')
-for (const c of ['帮我写一份公文', '给分行党委中心组补全学习记录']) {
+for (const c of ['帮我写一份公文', '把这份 PDF 转成 Markdown']) {
   const result = await run(c, { onDemand: true })
   console.log(`[${c}] → ${result}`)
 }
