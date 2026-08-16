@@ -1,0 +1,42 @@
+{
+  "name": "dsh-skill-router",
+  "version": "0.1.0",
+  "description": "Intent-level skill auto-routing for DeepSeek Harness: routes every user message against the skill catalog and injects the matching skill body automatically — the harness finally uses skills when it should.",
+  "type": "module",
+  "main": "./index.js",
+  "files": [
+    "index.js",
+    "README.md",
+    "README.en-US.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Phantomcyber-ai/dsh-skill-router.git"
+  },
+  "homepage": "https://github.com/Phantomcyber-ai/dsh-skill-router",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "skill",
+    "skill-router",
+    "skill-routing",
+    "agent",
+    "plugin"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test-router.mjs",
+    "pack": "npm pack"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc <2",
+    "@deepseek-ai/dsh-skill": ">=0.0.1-rc <2",
+    "@deepseek-ai/schemastery": ">=3.18.0",
+    "cordis": ">=4.0.0-rc <5"
+  }
+}
