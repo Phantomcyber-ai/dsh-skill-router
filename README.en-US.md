@@ -22,7 +22,7 @@ user message → heuristic scoring (zero LLM cost)
 - Reuses the official injection pipeline (`skill-invocation` source) — the same mechanism as the `/skill-name` gesture.
 - Never breaks the agent loop: any routing failure just falls back to the status quo.
 - No tools registered, no tool-catalog pollution.
-- Compatible with experimental presets: on `anchored-standard`-style compositions (no `skill` loader tool) auto-routing steps aside by default; the very first message of a fresh session is never injected (preserves the first-request Minimal anchor).
+- Compatible with experimental presets: on strict on-demand compositions with NO skill channel at all (`anchored-standard`-style, no `skill` and no `skill_load`/`skill_search`) auto-routing steps aside by default; **cot-family presets (cot-gw / cot-dyn) that expose `skill_load`/`skill_search` are auto-detected (`onDemandLoaderTools`) and routed normally** — automatic injection coexists with on-demand discovery. The very first message of a fresh session is never injected (preserves the first-request Minimal anchor).
 
 ## Install
 
@@ -45,12 +45,15 @@ Or add it to the profile `bundles` for persistent assembly.
 | `minScore` | `0.5` | Heuristic strong-hit threshold |
 | `llmTimeoutMs` | `12000` | LLM judgment timeout |
 | `skipShortMessages` | `true` | Skip "continue"/"ok" style messages |
-| `respectOnDemandPresets` | `true` | Yield to anchored-standard-style compositions (no `skill` tool) |
+| `respectOnDemandPresets` | `true` | Yield only when the composition has NO skill channel at all (`anchored-standard`-style); routed normally when `skill` OR any `onDemandLoaderTools` tool exists (standard / cot-gw / cot-dyn) |
+| `onDemandLoaderTools` | `['skill_load', 'skill_search']` | Tool names treated as an on-demand skill channel (cot-family presets) |
+| `verbose` | `true` | Log injections |
 
 ## Test
 
 ```bash
-node test-router.mjs    # functional test: simulated agent/pre-step with a real skill catalog
+node test-router.mjs    # functional test: standard / anchored scenarios
+node test-integration.mjs  # upgrade verification: cot-family auto-detection + routing (12 assertions)
 node debug-scoring.mjs  # scoring debug
 ```
 

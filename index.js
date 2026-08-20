@@ -9,6 +9,10 @@
  * 2. 强命中直接注入；弱信号交给 LLM 判定（hybrid 模式）；LLM 不可用/失败回退启发式；
  * 3. 命中即把技能全文以 `skill-invocation` 源注入上下文（与 `/技能名` 手势同一机制，
  *    复用 dsh-tool-skill 的注入管线），模型无需再调用 skill 工具。
+ * 4. on-demand 预设识别升级：`respectOnDemandPresets` 不再只看 `skill` 工具——
+ *    组合里存在 `skill_load`/`skill_search` 等按需通道（cot-gw / cot-dyn 等预设）
+ *    时视为可路由组合，自动注入与按需发现并存；两者皆无（严格 on-demand，如
+ *    anchored-standard）才让位跳过，避免破坏其零技能上下文设计。
  *
  * 任何异常都不会阻断 agent 循环（路由失败只意味着退回现状）。
  */
@@ -41,11 +45,17 @@ export const Config = z.object({
   /** 过短的消息（继续/嗯/好的）不路由，避免无谓 LLM 调用。 */
   skipShortMessages: z.boolean().default(true),
   /**
-   * 尊重 on-demand 预设（如 anchored-standard）：该组合故意移除技能目录注入，
-   * 改由模型用 skill_search/skill_load 按需发现。检测到当前 agent 没有 `skill`
-   * 加载工具时，默认不自动注入，避免破坏其"零技能上下文"设计；置 false 强制注入。
+   * 尊重 on-demand 预设：该流派（anchored-standard / cot-gw / cot-dyn）刻意移除
+   * 技能目录注入，改由模型用 skill_search/skill_load 按需发现。
+   * 判定规则（任一条件满足即视为"已提供技能通道"，正常自动路由；全部不满足才让位）：
+   * - 存在传统 `skill` 加载工具（dsh-tool-skill 挂载，standard 类组合）；
+   * - 存在 `onDemandLoaderTools` 中的任一工具（cot 类预设的 skill_load / skill_search）。
+   * 置 false 强制注入。
    */
   respectOnDemandPresets: z.boolean().default(true),
+  /** on-demand 组合中"已提供按需技能通道"的工具名（任一存在即视为可路由的预设）。
+   * 至少 1 个；空数组视为配置无效（装配时校验失败）。 */
+  onDemandLoaderTools: z.array(z.string()).min(1).default(['skill_load', 'skill_search']),
   /** 注入时写日志。 */
   verbose: z.boolean().default(true),
 })
@@ -60,6 +70,7 @@ const DEFAULT_CONFIG = {
   llmTimeoutMs: 12000,
   skipShortMessages: true,
   respectOnDemandPresets: true,
+  onDemandLoaderTools: ['skill_load', 'skill_search'],
   verbose: true,
 }
 
@@ -236,7 +247,7 @@ async function resolveRoute(ctx, config) {
 }
 
 /** 一次轻量 LLM 判定：返回命中的技能名列表，失败/超时返回 undefined。 */
-async function llmPick(ctx, config, text, candidates) {
+async function llmPick(ctx, config, text, candidates, signal) {
   const llm = ctx.get('llm')
   if (!llm || typeof llm.stream !== 'function') return undefined
   const route = await resolveRoute(ctx, config)
@@ -247,7 +258,8 @@ async function llmPick(ctx, config, text, candidates) {
       source: { kind: 'plugin', plugin: name },
     }),
   ]
-  const signal = AbortSignal.timeout(config.llmTimeoutMs)
+  // 同时受 agent 中止信号与判定超时约束：任一触发即中断 LLM 流
+  const callSignal = AbortSignal.any([signal, AbortSignal.timeout(config.llmTimeoutMs)])
   let output = ''
   try {
     for await (const chunk of llm.stream({
@@ -255,7 +267,7 @@ async function llmPick(ctx, config, text, candidates) {
       messages,
       temperature: 0,
       maxTokens: 120,
-      signal,
+      signal: callSignal,
     })) {
       if (chunk.type === 'finish') {
         if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') return undefined
@@ -308,7 +320,7 @@ async function pickSkills(ctx, config, text, candidates) {
   }
 
   if (config.mode === 'llm' || (config.mode === 'hybrid' && scored.length > 0)) {
-    const fromLlm = await llmPick(ctx, config, text, candidates)
+    const fromLlm = await llmPick(ctx, config, text, candidates, signal)
     if (fromLlm !== undefined && fromLlm.length > 0) return fromLlm
     // LLM 无匹配或调用失败：回退到启发式第一名（需有不弱于 0.7×阈值 的弱信号，防误注入）。
     if (best && best.score >= config.minScore * 0.7) return [best.skill.name]
@@ -316,8 +328,36 @@ async function pickSkills(ctx, config, text, candidates) {
   return []
 }
 
-function apply(ctx, config = {}) {
+/**
+ * 防御性配置规范化：程序化直调（绕过装配管线的 schemastery 校验）时，
+ * 保证关键字段类型/取值合法；非法值回退默认，避免运行期崩溃。
+ * 装配管线场景下此函数是幂等的（合法输入原样通过）。
+ */
+function normalizeConfig(config = {}) {
   const resolved = { ...DEFAULT_CONFIG, ...config }
+  if (!Array.isArray(resolved.onDemandLoaderTools) ||
+      resolved.onDemandLoaderTools.some((name) => typeof name !== 'string' || name.length === 0)) {
+    resolved.onDemandLoaderTools = [...DEFAULT_CONFIG.onDemandLoaderTools]
+  } else if (resolved.onDemandLoaderTools.length === 0) {
+    resolved.onDemandLoaderTools = [...DEFAULT_CONFIG.onDemandLoaderTools]
+  }
+  if (typeof resolved.maxSkillsPerMessage !== 'number' || resolved.maxSkillsPerMessage < 1) {
+    resolved.maxSkillsPerMessage = DEFAULT_CONFIG.maxSkillsPerMessage
+  }
+  if (typeof resolved.minScore !== 'number' || resolved.minScore <= 0 || resolved.minScore > 1) {
+    resolved.minScore = DEFAULT_CONFIG.minScore
+  }
+  if (typeof resolved.llmTimeoutMs !== 'number' || resolved.llmTimeoutMs <= 0) {
+    resolved.llmTimeoutMs = DEFAULT_CONFIG.llmTimeoutMs
+  }
+  if (!['hybrid', 'heuristic', 'llm'].includes(resolved.mode)) {
+    resolved.mode = DEFAULT_CONFIG.mode
+  }
+  return resolved
+}
+
+function apply(ctx, config = {}) {
+  const resolved = normalizeConfig(config)
 
   ctx.on(
     'agent/pre-step',
@@ -334,15 +374,27 @@ function apply(ctx, config = {}) {
   )
 }
 
+/**
+ * on-demand 预设识别：该组合是否已提供任何"技能加载/发现通道"。
+ * - `skill`（dsh-tool-skill 的传统加载工具）；
+ * - `onDemandLoaderTools`（cot 类预设的 skill_load / skill_search 等按需通道）。
+ * 两者皆无 → 严格 on-demand（anchored-standard 系）→ respectOnDemandPresets 下让位。
+ */
+function hasSkillLoader(ctx, agent, config) {
+  const getTool = typeof ctx.tools?.get === 'function' ? (name) => ctx.tools.get(name, agent) : () => undefined
+  if (getTool('skill') !== undefined) return true
+  return (config.onDemandLoaderTools ?? []).some((name) => getTool(name) !== undefined)
+}
+
 async function routeStep(ctx, config, { agent, messages, signal }, decision) {
   signal.throwIfAborted()
-  // 尊重 on-demand 预设：当前 agent 没有 `skill` 加载工具（dsh-tool-skill 未挂载，
-  // 如 anchored-standard 组合）时，默认不自动注入，避免破坏其"零技能上下文"设计。
+  // 尊重 on-demand 预设：当前 agent 没有任何技能加载/发现通道时（严格 on-demand，
+  // 如 anchored-standard 组合），默认不自动注入，避免破坏其"零技能上下文"设计。
+  // cot-gw / cot-dyn 等组合存在 skill_load/skill_search 通道，视为可路由，正常注入。
   if (config.respectOnDemandPresets) {
-    const loaderTool = typeof ctx.tools?.get === 'function' ? ctx.tools.get('skill', agent) : undefined
-    if (loaderTool === undefined) {
+    if (!hasSkillLoader(ctx, agent, config)) {
       if (config.verbose) {
-        ctx.logger?.info('[skill-router] 检测到 on-demand 预设（无 skill 加载工具），跳过自动注入（respectOnDemandPresets）')
+        ctx.logger?.info('[skill-router] 检测到严格 on-demand 预设（无 skill/skill_load 等加载工具），跳过自动注入（respectOnDemandPresets）')
       }
       return decision
     }
@@ -383,9 +435,17 @@ async function routeStep(ctx, config, { agent, messages, signal }, decision) {
   if (candidates.length === 0) return decision
 
   const picks = await pickSkills(ctx, config, text, candidates)
+  // 防重复注入：显式排除手势/其他注入源已在本轮注入的技能（decision.messages
+  // 中的 skill-invocation）与近期已自动注入的技能（injectedRecent）。
+  const alreadyPresent = new Set(
+    decision.messages
+      .filter((m) => m.source?.kind === 'skill-invocation' && typeof m.source.name === 'string')
+      .map((m) => m.source.name),
+  )
   const toInject = picks
     .filter((skillName) => !gestureNames.includes(skillName))
     .filter((skillName) => !wasInjectedRecently(agent, skillName))
+    .filter((skillName) => !alreadyPresent.has(skillName))
     .slice(0, config.maxSkillsPerMessage)
   if (toInject.length === 0) return decision
 
