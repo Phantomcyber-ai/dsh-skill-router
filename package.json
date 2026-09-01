@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-router",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Intent-level skill auto-routing for DeepSeek Harness: routes every user message against the skill catalog and injects the matching skill body automatically — the harness finally uses skills when it should.",
   "type": "module",
   "main": "./index.js",

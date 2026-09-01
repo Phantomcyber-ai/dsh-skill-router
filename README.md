@@ -18,6 +18,7 @@
 - **零侵入**：任何异常都不会阻断 agent 循环（路由失败只意味着退回现状）；不注册任何工具、不占工具目录
 - **防误伤**：每 agent 近期已注入技能不重复注入；短消息（继续/嗯）不路由；`/技能名` 手势由官方负责自动跳过
 - **与实验预设兼容**：`anchored-standard` 类组合（无 `skill` 加载工具）默认自动让位；**cot 系预设（cot-gw / cot-dyn）自动识别**——组合存在 `skill_load`/`skill_search` 等按需通道时视为可路由，自动注入与按需发现并存；全新会话首条消息不注入（保住首轮 Minimal 锚定）
+- **千人千面（v0.4）**：首次路由自动扫描当前环境**实际存在**的技能目录与 MCP 工具面（`ctx.tools.schemas` 枚举 `mcp__<server>__<tool>`）落盘个人基线并周期刷新；弱信号发现块按消息附带匹配的 MCP 工具提示，live 目录不完整时以基线回退
 
 ## 工作原理
 
@@ -55,6 +56,10 @@ dev_inject_plugin <本仓库目录>
 | `maxSkillsPerMessage` | `2` | 每条消息最多注入技能数 |
 | `minScore` | `0.5` | 启发式强命中阈值 |
 | `weakForm` | `summary` | 弱信号带（LLM 未判定命中）的回退形态：`summary` 注入紧凑摘要发现块（技能名 + 一行描述 + `/name` 手势引导；`plugin` 源，不占全文防重名单，后续强命中可升级全文）；`full` 回退注入全文（v0.2 行为）；`none` 不注入 |
+| `personalBaseline` | `true` | 首次安装/首次路由扫描当前环境技能目录 + MCP 工具面，落盘个人基线并周期刷新（千人千面） |
+| `hintMcpTools` | `true` | 弱信号发现块中包含按消息匹配的 MCP 工具（`mcp__<server>__<tool>`，来自基线扫描） |
+| `baselineRefreshHours` | `24` | 基线刷新周期（小时），到期后下一次路由触发重扫；删除基线文件可立即重扫 |
+| `baselineDir` | 空 | 基线落盘目录；留空 = `<DSH_HOME|~/.dsh>/plugins/dsh-skill-router/`（按 cwd 哈希分文件） |
 | `llmTimeoutMs` | `12000` | LLM 判定超时 |
 | `skipShortMessages` | `true` | "继续/嗯"等短消息不路由 |
 | `respectOnDemandPresets` | `true` | 组合无任何技能加载/发现通道（严格 on-demand，如 anchored-standard）时让位；**存在 `skill` 或 `onDemandLoaderTools` 中任一工具（standard / cot-gw / cot-dyn）时正常自动路由** |
@@ -84,6 +89,21 @@ dev_inject_plugin <本仓库目录>
 
 > 注：cot-gw 的请求面不含 skill 工具（仅 gateway 可转发），router 的自动注入是其技能可达的补强通道；如希望 cot-gw 保持"零注入"纯度，可对该会话设 `enabled: false`（或注入时不启用该插件行）。
 
+## 首次安装：千人千面环境扫描（v0.4）
+
+插件不假设任何固定技能清单。**首次路由时扫描当前环境实际存在的能力面**，落盘为个人基线：
+
+- **技能目录**：`ctx.skills.snapshot()`（name / description / whenToUse / 可调用性）；
+- **MCP 工具**：`ctx.tools.schemas()` 枚举 `mcp__<server>__<tool>` 注册名与描述；
+- **基线文件**：`<DSH_HOME|~/.dsh>/plugins/dsh-skill-router/baseline-<cwd哈希>.json`，默认 24h 周期刷新（删除文件即可触发重扫）。
+
+基线用途：
+
+1. **MCP 工具发现**：弱信号发现块按消息打分（与技能同一套中文感知启发式），把匹配的 MCP 工具（`mcp__github__search_issues: …`）附进 `<skill_hints>`——每个用户看到的是**自己环境里真有**的工具与技能，而非通用假设；`hintMcpTools: false` 可关闭。
+2. **目录回退**：live 技能目录不完整（`snapshot.complete=false`，如装配早期/热刷新窗口）时以基线技能作候选，路由不空转；全文仍经 `ctx.skills.get` 现取。
+
+所有扫描/落盘失败都会静默降级（无 `schemas` 方法的旧内核 → MCP 提示自动缺席），绝不阻断 agent 循环；`personalBaseline: false` 可整体关闭。
+
 ## 与实验预设（anchored-standard / router-standard）的兼容性
 
 | 预设 | 关系 |
@@ -94,6 +114,8 @@ dev_inject_plugin <本仓库目录>
 | **cot-gw / cot-dyn（思维链保护预设）** | **自动识别、正常路由**：该系组合没有 `skill` 工具，但挂载了 `skill_load`/`skill_search` 按需通道（`onDemandLoaderTools` 默认命中）。自动注入的仅是 user 文本（不触碰请求工具面），与 cot 系"请求面收敛 + 文本注入不影响思维链"的实验结论兼容；首条消息仍跳过，保住锚定 |
 
 ## 实测结果
+
+**兼容性**：已分别在已装内核（`0.1.2-alpha.1`，junction 真实依赖）与最新 `0.1.2-alpha.3`（registry 官方包 `dsh-llm`/`dsh-skill`/`schemastery@3.18.2` 离线组装）上跑同一 15 场景驱动——强命中/弱信号/LLM 判定/摘要发现/基线扫描与回退/降级路径全部通过。
 
 用真实会话技能目录（17 个技能）做的功能测试（`test-router.mjs`，无 LLM 环境验证启发式路径）：
 

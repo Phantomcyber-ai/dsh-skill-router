@@ -15,12 +15,19 @@
  *    组合里存在 `skill_load`/`skill_search` 等按需通道（cot-gw / cot-dyn 等预设）
  *    时视为可路由组合，自动注入与按需发现并存；两者皆无（严格 on-demand，如
  *    anchored-standard）才让位跳过，避免破坏其零技能上下文设计。
+ * 5. 千人千面：首次安装/首次路由扫描当前环境的技能目录与 MCP 工具面
+ *    （ctx.tools.schemas 枚举 mcp__<server>__<tool>）落盘个人基线并周期刷新；
+ *    弱信号发现块按消息补充匹配的 MCP 工具提示，live 目录不完整时以基线回退。
  *
  * 任何异常都不会阻断 agent 循环（路由失败只意味着退回现状）。
  */
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { isModelInvocable, renderSkillContent } from '@deepseek-ai/dsh-skill'
+import { createHash } from 'node:crypto'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 
 export const name = 'dsh-skill-router'
 export const inject = ['skills', 'tools']
@@ -67,6 +74,19 @@ export const Config = z.object({
    * - none：弱信号带不注入（最严格）。
    */
   weakForm: z.string().default('summary'),
+  /**
+   * 千人千面：首次安装/首次路由时扫描当前环境的技能目录与 MCP 工具面
+   * （ctx.tools.schemas 枚举 mcp__<server>__<tool>），落盘为个人基线并周期刷新。
+   * 用途：①弱信号发现块补充按消息匹配的 MCP 工具提示；②live 技能目录不完整
+   * （snapshot.complete=false）时以基线技能作候选回退（全文仍经 ctx.skills.get 现取）。
+   */
+  personalBaseline: z.boolean().default(true),
+  /** 基线刷新周期（小时）；到期后下一次路由触发重扫。 */
+  baselineRefreshHours: z.number().default(24),
+  /** 基线落盘目录；留空 = <DSH_HOME|~/.dsh>/plugins/dsh-skill-router/。 */
+  baselineDir: z.string().default(''),
+  /** 弱信号发现块是否包含按消息匹配的 MCP 工具（依赖基线扫描结果）。 */
+  hintMcpTools: z.boolean().default(true),
   /** 注入时写日志。 */
   verbose: z.boolean().default(true),
 })
@@ -83,6 +103,10 @@ const DEFAULT_CONFIG = {
   respectOnDemandPresets: true,
   onDemandLoaderTools: ['skill_load', 'skill_search'],
   weakForm: 'summary',
+  personalBaseline: true,
+  baselineRefreshHours: 24,
+  baselineDir: '',
+  hintMcpTools: true,
   verbose: true,
 }
 
@@ -294,6 +318,69 @@ async function llmPick(ctx, config, text, candidates, signal) {
   return names.length > 0 ? names : undefined
 }
 
+// ---------- 千人千面：环境基线（首次安装扫描技能目录 + MCP 工具面） ----------
+
+const baselineCaches = new Map() // cwd → { data, loadedAt }
+
+function baselineFileFor(config, cwd) {
+  const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
+  const dir = config.baselineDir || join(dshHome, 'plugins', 'dsh-skill-router')
+  const key = createHash('sha256').update(cwd).digest('hex').slice(0, 16)
+  return join(dir, `baseline-${key}.json`)
+}
+
+/** 扫描当前环境：技能目录（name/description/whenToUse）+ MCP 工具面（mcp__* 注册名与描述）。 */
+async function scanBaseline(ctx, agent, lookup) {
+  const baseline = { version: 1, scannedAt: new Date().toISOString(), cwd: lookup.cwd ?? null, skills: [], mcpTools: [] }
+  try {
+    const snapshot = await ctx.skills.snapshot(lookup)
+    baseline.skills = (snapshot?.skills ?? []).slice(0, 200).map((skill) => ({
+      name: skill.name,
+      description: skill.description ?? '',
+      whenToUse: skill.whenToUse ?? '',
+      modelInvocable: skill.invocation?.modelInvocable !== false,
+    }))
+  } catch { /* 目录服务不可用 → 留空，下次到期重扫 */ }
+  try {
+    if (typeof ctx.tools?.schemas === 'function') {
+      baseline.mcpTools = ctx.tools.schemas(agent)
+        .filter((schema) => typeof schema?.name === 'string' && schema.name.startsWith('mcp__'))
+        .slice(0, 200)
+        .map((schema) => ({ name: schema.name, description: schema.description ?? '' }))
+    }
+  } catch { /* 工具面枚举不可用 → 留空 */ }
+  baseline.skillCount = baseline.skills.length
+  baseline.mcpCount = baseline.mcpTools.length
+  return baseline
+}
+
+/** 加载/刷新个人基线：文件缺失或过期时重扫落盘；进程内按 cwd 缓存。任何失败都不阻断路由。 */
+async function ensureBaseline(ctx, config, agent, lookup) {
+  if (!config.personalBaseline) return undefined
+  const cwd = lookup.cwd || '(no-cwd)'
+  const cached = baselineCaches.get(cwd)
+  const maxAgeMs = config.baselineRefreshHours * 3600000
+  if (cached && Date.now() - cached.loadedAt < maxAgeMs) return cached.data
+  const file = baselineFileFor(config, cwd)
+  let data
+  try {
+    data = JSON.parse(readFileSync(file, 'utf8'))
+  } catch { data = undefined }
+  const stale = !data || typeof data.scannedAt !== 'string' || Date.now() - Date.parse(data.scannedAt) > maxAgeMs
+  if (stale) {
+    try {
+      data = await scanBaseline(ctx, agent, lookup)
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, JSON.stringify(data, null, 2))
+      if (config.verbose) {
+        ctx.logger?.info('[skill-router] 环境基线已扫描: %d 技能 / %d MCP 工具 → %s', data.skillCount, data.mcpCount, file)
+      }
+    } catch { /* 扫描/落盘失败 → 沿用旧基线或无基线继续 */ }
+  }
+  if (data) baselineCaches.set(cwd, { data, loadedAt: Date.now() })
+  return data
+}
+
 /** 每 agent 近期已自动注入的技能（WeakMap，防同技能重复注入）。 */
 const injectedRecent = new WeakMap()
 
@@ -376,6 +463,9 @@ function normalizeConfig(config = {}) {
   if (!['summary', 'full', 'none'].includes(resolved.weakForm)) {
     resolved.weakForm = DEFAULT_CONFIG.weakForm
   }
+  if (typeof resolved.baselineRefreshHours !== 'number' || resolved.baselineRefreshHours <= 0) {
+    resolved.baselineRefreshHours = DEFAULT_CONFIG.baselineRefreshHours
+  }
   return resolved
 }
 
@@ -451,10 +541,28 @@ async function routeStep(ctx, config, { agent, messages, signal }, decision) {
   }
 
   const lookup = { cwd: agent.session.header.cwd, signal, scope: agent }
+  const baseline = await ensureBaseline(ctx, config, agent, lookup)
+  signal.throwIfAborted()
   const snapshot = await ctx.skills.snapshot(lookup)
   signal.throwIfAborted()
-  if (!snapshot.complete) return decision
-  const candidates = snapshot.skills.filter(isModelInvocable)
+  // 千人千面回退：live 目录不完整时用个人基线里的技能当候选（全文仍走 ctx.skills.get 现取）。
+  let skillSnapshot = snapshot
+  if (!snapshot.complete && baseline?.skills?.length > 0) {
+    skillSnapshot = {
+      complete: true,
+      skills: baseline.skills.map((skill) => ({
+        name: skill.name,
+        description: skill.description,
+        whenToUse: skill.whenToUse,
+        invocation: { modelInvocable: skill.modelInvocable !== false },
+      })),
+    }
+    if (config.verbose) {
+      ctx.logger?.info('[skill-router] live 技能目录不完整，回退个人基线（%d 技能）', baseline.skills.length)
+    }
+  }
+  if (!skillSnapshot.complete) return decision
+  const candidates = skillSnapshot.skills.filter(isModelInvocable)
   if (candidates.length === 0) return decision
 
   const picks = await pickSkills(ctx, config, text, candidates, signal)
@@ -472,25 +580,53 @@ async function routeStep(ctx, config, { agent, messages, signal }, decision) {
     .filter((skillName) => !wasInjectedRecently(agent, skillName))
     .filter((skillName) => !alreadyPresent.has(skillName))
     .slice(0, config.maxSkillsPerMessage)
-  if (toInject.length === 0) return decision
+  if (toInject.length === 0 && picks.form !== 'none') return decision
 
-  if (picks.form === 'summary') {
-    // 摘要发现块：弱信号不塞全文（数 KB），给模型一个廉价的"发现"入口；
-    // 需要全文时由模型/用户用 /name 手势（或 skill_load，若可用）显式加载。
+  // MCP 工具发现（千人千面）：按消息给 mcp__* 工具打分，取弱信号阈值以上的命中。
+  let mcpMatches = []
+  if (config.hintMcpTools && baseline?.mcpTools?.length > 0) {
+    const messageTokens = collectTokens(text, true)
+    mcpMatches = baseline.mcpTools
+      .map((tool) => ({
+        tool,
+        score: scoreSkill({ name: tool.name, description: tool.description, whenToUse: '' }, messageTokens, text),
+      }))
+      .filter((entry) => entry.score >= config.minScore * 0.7)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, config.maxSkillsPerMessage)
+      .map((entry) => entry.tool)
+  }
+
+  if (picks.form === 'summary' || (picks.form === 'none' && mcpMatches.length > 0)) {
+    // 摘要发现块：弱信号不塞全文（数 KB），给模型一个廉价的"发现"入口。
+    // 技能行来自命中技能；MCP 行来自个人基线扫描的 mcp__* 工具（千人千面）。
     const byName = new Map(candidates.map((skill) => [skill.name, skill]))
-    const lines = toInject
-      .map((skillName) => byName.get(skillName))
-      .filter((skill) => skill !== undefined)
-      .map((skill) => `- ${skill.name}: ${(skill.description || '').split('\n')[0]}`)
+    const lines = []
+    if (picks.form === 'summary') {
+      for (const skillName of toInject) {
+        const skill = byName.get(skillName)
+        if (skill !== undefined) lines.push(`- ${skill.name}: ${(skill.description || '').split('\n')[0]}`)
+      }
+    }
+    for (const tool of mcpMatches) {
+      lines.push(`- ${tool.name}: ${(tool.description || '').split('\n')[0]}`)
+    }
     if (lines.length === 0) return decision
     if (config.verbose) {
-      ctx.logger?.info('[skill-router] 弱信号摘要发现: %s（消息: %s）', toInject.join(', '), text.slice(0, 60))
+      ctx.logger?.info(
+        '[skill-router] 弱信号摘要发现: %s（消息: %s）',
+        [...toInject, ...mcpMatches.map((tool) => tool.name)].join(', '),
+        text.slice(0, 60),
+      )
     }
+    const footer = toInject.length > 0
+      ? `需要技能全文时用 /${toInject[0]} 手势调用（或 skill_load，若可用）；MCP 工具可直接调用；与任务无关可忽略本提示。`
+      : '以上为按本环境实际能力匹配的线索：技能可用 /name 手势或 skill_load 加载全文，MCP 工具可直接调用。'
     const hints = [
       '<skill_hints>',
-      '以下技能可能与当前任务相关（按匹配度排序，全文尚未注入）：',
+      '以下能力可能与当前任务相关（按匹配度排序，技能全文尚未注入）：',
       ...lines,
-      `需要全文时用 /${toInject[0]} 手势调用（或 skill_load，若可用）；与任务无关可忽略本提示。`,
+      footer,
       '</skill_hints>',
     ].join('\n')
     return {

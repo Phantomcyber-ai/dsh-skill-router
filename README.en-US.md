@@ -23,6 +23,7 @@ user message → heuristic scoring (zero LLM cost)
 
 - Chinese-aware heuristic: CJK bigram segmentation (stopword filtering), latin token overlap, skill-name and `whenToUse` trigger-phrase hits.
 - Three-tier routing: strong hits inject the full body; weak signals go to LLM judgment; the unresolved weak band falls back to a compact **skill-hints summary block** by default (`weakForm: summary`) — borrowing the discovery/loading separation of [dsh_cot_gw_dyn](https://github.com/CZM1998/dsh_cot_gw_dyn)'s `skill_search` (large-body injections perturb trajectories; summaries are cheap to discover from), while staying zero-tool-registration.
+- **Per-user personalization (v0.4)**: on first route the plugin scans this environment's actual skill catalog and MCP tool surface (`ctx.tools.schemas` enumerating `mcp__<server>__<tool>`) into a persisted baseline (refreshed periodically). The weak-signal hints block additionally lists message-matched MCP tools — every user discovers what *their* environment really has — and an incomplete live catalog falls back to baseline candidates.
 - Reuses the official injection pipeline (`skill-invocation` source) — the same mechanism as the `/skill-name` gesture.
 - Never breaks the agent loop: any routing failure just falls back to the status quo.
 - No tools registered, no tool-catalog pollution.
@@ -48,6 +49,10 @@ Or add it to the profile `bundles` for persistent assembly.
 | `maxSkillsPerMessage` | `2` | Max skills injected per message |
 | `minScore` | `0.5` | Heuristic strong-hit threshold |
 | `weakForm` | `summary` | Fallback form for the weak band (no judged hit): `summary` injects a compact hints block (skill name + one-line description + `/name` gesture hint; `plugin` source, does not occupy the full-text dedup set, a later strong hit can still upgrade to full text); `full` falls back to the full body (v0.2 behavior); `none` injects nothing |
+| `personalBaseline` | `true` | On first route, scan this environment's actual skill catalog + MCP tool surface and persist a per-workspace baseline, refreshed periodically (per-user personalization) |
+| `hintMcpTools` | `true` | Include message-matched MCP tools (`mcp__<server>__<tool>`, from the baseline scan) in the weak-signal hints block |
+| `baselineRefreshHours` | `24` | Baseline refresh interval; the next routed step rescans when expired (delete the file to force a rescan) |
+| `baselineDir` | empty | Baseline directory; empty = `<DSH_HOME|~/.dsh>/plugins/dsh-skill-router/` (one file per cwd hash) |
 | `llmTimeoutMs` | `12000` | LLM judgment timeout |
 | `skipShortMessages` | `true` | Skip "continue"/"ok" style messages |
 | `respectOnDemandPresets` | `true` | Yield only when the composition has NO skill channel at all (`anchored-standard`-style); routed normally when `skill` OR any `onDemandLoaderTools` tool exists (standard / cot-gw / cot-dyn) |
