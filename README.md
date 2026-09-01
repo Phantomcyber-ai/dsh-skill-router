@@ -13,8 +13,8 @@
 
 ## 特性
 
-- **两级路由**：中文感知的启发式打分（bigram 切段去虚词 + 拉丁 token 重叠 + 技能名/触发短语命中）零成本快速命中；弱信号才调 LLM 判定（hybrid 模式，默认）
-- **复用官方注入管线**：命中即按 `skill-invocation` 源注入技能全文——与 `/技能名` 手势（dsh-tool-skill）完全同一机制，UI 正常展示
+- **三级路由**：中文感知的启发式打分（bigram 切段去虚词 + 拉丁 token 重叠 + 技能名/触发短语命中）零成本快速命中；强命中全文注入，弱信号交 LLM 判定（hybrid 模式，默认），LLM 未命中时弱信号带按 `weakForm` 回退——默认注入**摘要发现块**而非全文（吸收 dsh_cot_gw_dyn skill-search 的"发现/加载分离"思想）
+- **复用官方注入管线**：全文命中按 `skill-invocation` 源注入技能全文——与 `/技能名` 手势（dsh-tool-skill）完全同一机制，UI 正常展示
 - **零侵入**：任何异常都不会阻断 agent 循环（路由失败只意味着退回现状）；不注册任何工具、不占工具目录
 - **防误伤**：每 agent 近期已注入技能不重复注入；短消息（继续/嗯）不路由；`/技能名` 手势由官方负责自动跳过
 - **与实验预设兼容**：`anchored-standard` 类组合（无 `skill` 加载工具）默认自动让位；**cot 系预设（cot-gw / cot-dyn）自动识别**——组合存在 `skill_load`/`skill_search` 等按需通道时视为可路由，自动注入与按需发现并存；全新会话首条消息不注入（保住首轮 Minimal 锚定）
@@ -24,8 +24,11 @@
 ```
 用户消息 → 启发式打分（零 LLM 成本）
             ├─ 强命中(≥minScore) → 直接注入技能全文（不调 LLM）
-            └─ 弱信号 → LLM 判定（12s 超时/失败回退启发式第一名）
-                    → createUserMessage + skill-invocation 源注入
+            └─ 弱信号 → LLM 判定（12s 超时/失败回退弱信号带）
+                    ├─ 判定命中 → 注入技能全文（createUserMessage + skill-invocation 源）
+                    └─ 回退按 weakForm ─ summary：紧凑摘要发现块（默认）
+                                        ├ full：全文回退（v0.2 行为）
+                                        └ none：不注入
 ```
 
 注入发生在 `agent/pre-step`（与 dsh-tool-skill 同一事件、同一注入管线），模型在同一个 step 就能看到技能正文并直接使用。
@@ -51,6 +54,7 @@ dev_inject_plugin <本仓库目录>
 | `llmProvider` / `llmModel` | 空 | 指定判定模型；留空自动选第一个可用 provider |
 | `maxSkillsPerMessage` | `2` | 每条消息最多注入技能数 |
 | `minScore` | `0.5` | 启发式强命中阈值 |
+| `weakForm` | `summary` | 弱信号带（LLM 未判定命中）的回退形态：`summary` 注入紧凑摘要发现块（技能名 + 一行描述 + `/name` 手势引导；`plugin` 源，不占全文防重名单，后续强命中可升级全文）；`full` 回退注入全文（v0.2 行为）；`none` 不注入 |
 | `llmTimeoutMs` | `12000` | LLM 判定超时 |
 | `skipShortMessages` | `true` | "继续/嗯"等短消息不路由 |
 | `respectOnDemandPresets` | `true` | 组合无任何技能加载/发现通道（严格 on-demand，如 anchored-standard）时让位；**存在 `skill` 或 `onDemandLoaderTools` 中任一工具（standard / cot-gw / cot-dyn）时正常自动路由** |
@@ -59,6 +63,8 @@ dev_inject_plugin <本仓库目录>
 ## 与 cot 系预设（cot-gw / cot-dyn）整合
 
 [dsch_cot_gw_dyn](https://github.com/CZM1998/dsh_cot_gw_dyn) 的思维链保护预设移除了 9KB 技能目录注入、改由 `skill_search`/`skill_load` 按需发现。两者互补：cot 系解决"能力可达、请求面收敛"，本插件解决"模型该用技能时漏用"。本插件升级版（v0.2）自动识别该系预设并正常路由，无需手动改配置。
+
+**v0.3 进一步吸收其 skill-search 的「发现/加载分离」思想**：cot 实验证明大块全文/目录注入会扰动轨迹，因此本插件在弱信号带（打分偏低且 LLM 未判定命中）默认不再回退注入数 KB 全文，而是注入一个紧凑的 `<skill_hints>` 摘要块（技能名 + 一行描述 + `/name` 手势引导），由模型自行决定是否加载全文——与 `skill_search` 的"摘要发现、按需加载"同一哲学，但保持**零工具注册**。需要旧行为可设 `weakForm: 'full'`。
 
 **cot-dyn 推荐装配**（preset 内嵌，见 dsh_cot_gw_dyn 的整合说明）：
 
@@ -70,6 +76,7 @@ dev_inject_plugin <本仓库目录>
     respectOnDemandPresets: true   # 自动识别（cot-dyn 挂载了 skill_load，默认即开启路由）
     onDemandLoaderTools: ['skill_load', 'skill_search']
     maxSkillsPerMessage: 1         # 思维链保护：一次只注入一个技能全文
+    weakForm: 'summary'            # 弱信号只给摘要发现块，不塞全文（v0.3 默认值，显式写出便于回退 full）
     mode: hybrid
 ```
 
@@ -100,7 +107,7 @@ dev_inject_plugin <本仓库目录>
 | 写一份向上级报送的专项报告 | `report-drafting` ✓ |
 | 用 gh 查一下这个 PR | `github` ✓ |
 | 继续 / 嗯 | 跳过（短消息）✓ |
-| B站视频转文字 / 知乎搜索 / 找海报技能 / 网页截图 | 弱信号 → 生产环境由 LLM 判定 ✓ |
+| B站视频转文字 / 知乎搜索 / 找海报技能 / 网页截图 | 弱信号 → LLM 判定；未命中时摘要发现块（`weakForm: summary` 默认）✓ |
 
 ## 开发
 

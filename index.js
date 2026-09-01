@@ -6,8 +6,10 @@
  *
  * 方案：在 `agent/pre-step` 钩子里对最新用户消息做路由——
  * 1. 启发式快速打分（中文 bigram + 拉丁 token 重叠 + 技能名/触发短语命中）；
- * 2. 强命中直接注入；弱信号交给 LLM 判定（hybrid 模式）；LLM 不可用/失败回退启发式；
- * 3. 命中即把技能全文以 `skill-invocation` 源注入上下文（与 `/技能名` 手势同一机制，
+ * 2. 强命中直接注入全文；弱信号交给 LLM 判定（hybrid 模式）；LLM 不可用/失败
+ *    时弱信号带按 `weakForm` 回退：summary（默认，吸收 dsh_cot_gw_dyn skill-search
+ *    的"发现/加载分离"思路）注入紧凑摘要提示而非全文，full 注入全文，none 关闭；
+ * 3. 全文命中以 `skill-invocation` 源注入上下文（与 `/技能名` 手势同一机制，
  *    复用 dsh-tool-skill 的注入管线），模型无需再调用 skill 工具。
  * 4. on-demand 预设识别升级：`respectOnDemandPresets` 不再只看 `skill` 工具——
  *    组合里存在 `skill_load`/`skill_search` 等按需通道（cot-gw / cot-dyn 等预设）
@@ -56,6 +58,15 @@ export const Config = z.object({
   /** on-demand 组合中"已提供按需技能通道"的工具名（任一存在即视为可路由的预设）。
    * 至少 1 个；空数组视为配置无效（装配时校验失败）。 */
   onDemandLoaderTools: z.array(z.string()).min(1).default(['skill_load', 'skill_search']),
+  /**
+   * 弱信号带（0 < 得分 < minScore 且 LLM 未判定命中）的回退注入形态——吸收
+   * dsh_cot_gw_dyn skill-search 的"发现/加载分离"思路（大块全文注入扰动轨迹）：
+   * - summary（默认）：注入紧凑的技能提示块（name + 一行描述 + /name 手势引导），
+   *   让模型廉价地"发现"技能再决定是否加载；不占全文防重名单，后续强命中可升级全文；
+   * - full：直接注入第一名技能全文（v0.2 行为）；
+   * - none：弱信号带不注入（最严格）。
+   */
+  weakForm: z.string().default('summary'),
   /** 注入时写日志。 */
   verbose: z.boolean().default(true),
 })
@@ -71,6 +82,7 @@ const DEFAULT_CONFIG = {
   skipShortMessages: true,
   respectOnDemandPresets: true,
   onDemandLoaderTools: ['skill_load', 'skill_search'],
+  weakForm: 'summary',
   verbose: true,
 }
 
@@ -303,29 +315,37 @@ function markInjected(agent, skillName) {
   }
 }
 
-/** 对一条用户消息执行完整路由：返回要注入的技能名列表。 */
+/** 对一条用户消息执行完整路由：返回 { names, form }——form 为注入形态：
+ * 'full'（全文，skill-invocation 源）/ 'summary'（摘要发现块，plugin 源）/ 'none'。 */
 async function pickSkills(ctx, config, text, candidates, signal) {
   const scored = heuristicPick(text, candidates, config)
   const best = scored[0]
   const topNames = (count) => scored.slice(0, count).map((entry) => entry.skill.name)
 
-  if (config.mode === 'heuristic') return topNames(config.maxSkillsPerMessage)
+  if (config.mode === 'heuristic') return { names: topNames(config.maxSkillsPerMessage), form: 'full' }
 
   if (best && best.score >= config.minScore) {
     // 强命中：与第一名差距很小的并列技能一起注入，但不超过上限。
-    return scored
-      .filter((entry) => entry.score >= best.score - 0.15)
-      .slice(0, config.maxSkillsPerMessage)
-      .map((entry) => entry.skill.name)
+    return {
+      names: scored
+        .filter((entry) => entry.score >= best.score - 0.15)
+        .slice(0, config.maxSkillsPerMessage)
+        .map((entry) => entry.skill.name),
+      form: 'full',
+    }
   }
 
   if (config.mode === 'llm' || (config.mode === 'hybrid' && scored.length > 0)) {
     const fromLlm = await llmPick(ctx, config, text, candidates, signal)
-    if (fromLlm !== undefined && fromLlm.length > 0) return fromLlm
-    // LLM 无匹配或调用失败：回退到启发式第一名（需有不弱于 0.7×阈值 的弱信号，防误注入）。
-    if (best && best.score >= config.minScore * 0.7) return [best.skill.name]
+    if (fromLlm !== undefined && fromLlm.length > 0) return { names: fromLlm, form: 'full' }
+    // LLM 无匹配或调用失败：弱信号带按 weakForm 回退（吸收 dsh_cot_gw_dyn
+    // skill-search 的"发现/加载分离"——摘要发现优先于全文回退，防大块注入扰动）。
+    if (best && best.score >= config.minScore * 0.7) {
+      if (config.weakForm === 'full') return { names: [best.skill.name], form: 'full' }
+      if (config.weakForm === 'summary') return { names: [best.skill.name], form: 'summary' }
+    }
   }
-  return []
+  return { names: [], form: 'none' }
 }
 
 /**
@@ -352,6 +372,9 @@ function normalizeConfig(config = {}) {
   }
   if (!['hybrid', 'heuristic', 'llm'].includes(resolved.mode)) {
     resolved.mode = DEFAULT_CONFIG.mode
+  }
+  if (!['summary', 'full', 'none'].includes(resolved.weakForm)) {
+    resolved.weakForm = DEFAULT_CONFIG.weakForm
   }
   return resolved
 }
@@ -437,17 +460,50 @@ async function routeStep(ctx, config, { agent, messages, signal }, decision) {
   const picks = await pickSkills(ctx, config, text, candidates, signal)
   // 防重复注入：显式排除手势/其他注入源已在本轮注入的技能（decision.messages
   // 中的 skill-invocation）与近期已自动注入的技能（injectedRecent）。
+  // 摘要发现块同受约束（全文已在场的技能无需摘要提示），但不回写防重名单——
+  // 后续强命中同技能时仍可升级为全文注入。
   const alreadyPresent = new Set(
     decision.messages
       .filter((m) => m.source?.kind === 'skill-invocation' && typeof m.source.name === 'string')
       .map((m) => m.source.name),
   )
-  const toInject = picks
+  const toInject = picks.names
     .filter((skillName) => !gestureNames.includes(skillName))
     .filter((skillName) => !wasInjectedRecently(agent, skillName))
     .filter((skillName) => !alreadyPresent.has(skillName))
     .slice(0, config.maxSkillsPerMessage)
   if (toInject.length === 0) return decision
+
+  if (picks.form === 'summary') {
+    // 摘要发现块：弱信号不塞全文（数 KB），给模型一个廉价的"发现"入口；
+    // 需要全文时由模型/用户用 /name 手势（或 skill_load，若可用）显式加载。
+    const byName = new Map(candidates.map((skill) => [skill.name, skill]))
+    const lines = toInject
+      .map((skillName) => byName.get(skillName))
+      .filter((skill) => skill !== undefined)
+      .map((skill) => `- ${skill.name}: ${(skill.description || '').split('\n')[0]}`)
+    if (lines.length === 0) return decision
+    if (config.verbose) {
+      ctx.logger?.info('[skill-router] 弱信号摘要发现: %s（消息: %s）', toInject.join(', '), text.slice(0, 60))
+    }
+    const hints = [
+      '<skill_hints>',
+      '以下技能可能与当前任务相关（按匹配度排序，全文尚未注入）：',
+      ...lines,
+      `需要全文时用 /${toInject[0]} 手势调用（或 skill_load，若可用）；与任务无关可忽略本提示。`,
+      '</skill_hints>',
+    ].join('\n')
+    return {
+      kind: 'enter',
+      messages: [
+        ...decision.messages,
+        createUserMessage({
+          content: [{ type: 'text', text: hints }],
+          source: { kind: 'plugin', plugin: name },
+        }),
+      ],
+    }
+  }
 
   const injections = []
   for (const skillName of toInject) {

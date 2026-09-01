@@ -14,11 +14,15 @@
 ```
 user message → heuristic scoring (zero LLM cost)
                 ├─ strong hit (≥ minScore) → inject skill body directly
-                └─ weak signal → LLM judgment (12s timeout, falls back to heuristic top-1)
-                        → inject via createUserMessage + skill-invocation source
+                └─ weak signal → LLM judgment (12s timeout, falls back to the weak band)
+                        ├─ judged hit → inject skill body (createUserMessage + skill-invocation source)
+                        └─ fallback per weakForm ─ summary: compact hints block (default)
+                                                ├ full: body fallback (v0.2 behavior)
+                                                └ none: skip
 ```
 
 - Chinese-aware heuristic: CJK bigram segmentation (stopword filtering), latin token overlap, skill-name and `whenToUse` trigger-phrase hits.
+- Three-tier routing: strong hits inject the full body; weak signals go to LLM judgment; the unresolved weak band falls back to a compact **skill-hints summary block** by default (`weakForm: summary`) — borrowing the discovery/loading separation of [dsh_cot_gw_dyn](https://github.com/CZM1998/dsh_cot_gw_dyn)'s `skill_search` (large-body injections perturb trajectories; summaries are cheap to discover from), while staying zero-tool-registration.
 - Reuses the official injection pipeline (`skill-invocation` source) — the same mechanism as the `/skill-name` gesture.
 - Never breaks the agent loop: any routing failure just falls back to the status quo.
 - No tools registered, no tool-catalog pollution.
@@ -43,6 +47,7 @@ Or add it to the profile `bundles` for persistent assembly.
 | `llmProvider` / `llmModel` | empty | Judge model route; empty = auto-pick first available provider |
 | `maxSkillsPerMessage` | `2` | Max skills injected per message |
 | `minScore` | `0.5` | Heuristic strong-hit threshold |
+| `weakForm` | `summary` | Fallback form for the weak band (no judged hit): `summary` injects a compact hints block (skill name + one-line description + `/name` gesture hint; `plugin` source, does not occupy the full-text dedup set, a later strong hit can still upgrade to full text); `full` falls back to the full body (v0.2 behavior); `none` injects nothing |
 | `llmTimeoutMs` | `12000` | LLM judgment timeout |
 | `skipShortMessages` | `true` | Skip "continue"/"ok" style messages |
 | `respectOnDemandPresets` | `true` | Yield only when the composition has NO skill channel at all (`anchored-standard`-style); routed normally when `skill` OR any `onDemandLoaderTools` tool exists (standard / cot-gw / cot-dyn) |
