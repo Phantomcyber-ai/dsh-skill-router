@@ -304,7 +304,7 @@ function markInjected(agent, skillName) {
 }
 
 /** 对一条用户消息执行完整路由：返回要注入的技能名列表。 */
-async function pickSkills(ctx, config, text, candidates) {
+async function pickSkills(ctx, config, text, candidates, signal) {
   const scored = heuristicPick(text, candidates, config)
   const best = scored[0]
   const topNames = (count) => scored.slice(0, count).map((entry) => entry.skill.name)
@@ -434,7 +434,7 @@ async function routeStep(ctx, config, { agent, messages, signal }, decision) {
   const candidates = snapshot.skills.filter(isModelInvocable)
   if (candidates.length === 0) return decision
 
-  const picks = await pickSkills(ctx, config, text, candidates)
+  const picks = await pickSkills(ctx, config, text, candidates, signal)
   // 防重复注入：显式排除手势/其他注入源已在本轮注入的技能（decision.messages
   // 中的 skill-invocation）与近期已自动注入的技能（injectedRecent）。
   const alreadyPresent = new Set(
