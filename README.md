@@ -115,7 +115,7 @@ dev_inject_plugin <本仓库目录>
 
 ## 实测结果
 
-**兼容性**：已分别在已装内核（`0.1.2-alpha.1`，junction 真实依赖）与最新 `0.1.2-alpha.3`（registry 官方包 `dsh-llm`/`dsh-skill`/`schemastery@3.18.2` 离线组装）上跑同一 15 场景驱动——强命中/弱信号/LLM 判定/摘要发现/基线扫描与回退/降级路径全部通过。
+**兼容性**：同一套 18 场景驱动在三个内核上全量通过——已装 `0.1.2-alpha.1`（junction 真实依赖）、`0.1.2-alpha.3` 与最新 `0.1.2-alpha.5`（registry 官方包离线组装）。v0.4.1 适配 alpha.4 的 breaking change：`Session.events` 被按需读取 API（`snapshotEvents()`/`eventAt(seq)`）取代，首条消息检测优先走新 API，旧内核自动回退 `events` 数组，读取失败保守放行。
 
 用真实会话技能目录（17 个技能）做的功能测试（`test-router.mjs`，无 LLM 环境验证启发式路径）：
 

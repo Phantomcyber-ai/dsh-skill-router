@@ -18,6 +18,8 @@
  * 5. 千人千面：首次安装/首次路由扫描当前环境的技能目录与 MCP 工具面
  *    （ctx.tools.schemas 枚举 mcp__<server>__<tool>）落盘个人基线并周期刷新；
  *    弱信号发现块按消息补充匹配的 MCP 工具提示，live 目录不完整时以基线回退。
+ * 6. alpha.4+ 兼容：`Session.events` 已被按需 API 取代（snapshotEvents/eventAt），
+ *    首条消息检测优先用新 API，旧内核回退 events 数组。
  *
  * 任何异常都不会阻断 agent 循环（路由失败只意味着退回现状）。
  */
@@ -499,6 +501,29 @@ function hasSkillLoader(ctx, agent, config) {
   return (config.onDemandLoaderTools ?? []).some((name) => getTool(name) !== undefined)
 }
 
+/**
+ * 会话首条消息检测：dsh-v0.1.2-alpha.4 起 `Session.events` 被按需读取 API 取代
+ * （`snapshotEvents()` / `eventAt(seq)`），优先用新 API；旧内核（rc 系～alpha.3）
+ * 无该方法时回退 `events` 数组；两者都不可读时保守放行（等同旧版跳过检测的行为）。
+ */
+function hasPriorUserMessage(session) {
+  if (typeof session?.snapshotEvents === 'function') {
+    try {
+      const events = session.snapshotEvents()
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        if (events[index]?.type === 'user/message') return true
+      }
+      return false
+    } catch { return true }
+  }
+  const events = session?.events
+  if (!Array.isArray(events)) return true
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index]?.type === 'user/message') return true
+  }
+  return false
+}
+
 async function routeStep(ctx, config, { agent, messages, signal }, decision) {
   signal.throwIfAborted()
   // 尊重 on-demand 预设：当前 agent 没有任何技能加载/发现通道时（严格 on-demand，
@@ -519,19 +544,9 @@ async function routeStep(ctx, config, { agent, messages, signal }, decision) {
 
   // 全新会话的第一条消息不路由：保住 anchored 系预设（anchored-standard/anchored-wsl）
   // 的首轮 Minimal 锚定（bootstrap 阶段压制注入上下文）。从第二条用户消息起正常路由。
-  const events = agent.session?.events
-  if (Array.isArray(events)) {
-    let hasPriorUserMessage = false
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      if (events[index].type === 'user/message') {
-        hasPriorUserMessage = true
-        break
-      }
-    }
-    if (!hasPriorUserMessage) {
-      if (config.verbose) ctx.logger?.info('[skill-router] 会话首条消息，跳过自动注入（保住首轮锚定）')
-      return decision
-    }
+  if (!hasPriorUserMessage(agent.session)) {
+    if (config.verbose) ctx.logger?.info('[skill-router] 会话首条消息，跳过自动注入（保住首轮锚定）')
+    return decision
   }
 
   const gestureNames = gestureSkillNames(text)
